@@ -1,6 +1,7 @@
 package ru.yandexpraktikum.blechat.data.bluetooth
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
@@ -27,6 +28,7 @@ import ru.yandexpraktikum.blechat.domain.model.ScannedBluetoothDevice
 import ru.yandexpraktikum.blechat.utils.checkForConnectPermission
 import ru.yandexpraktikum.blechat.utils.notifyCharUUID
 import ru.yandexpraktikum.blechat.utils.serviceUUID
+import ru.yandexpraktikum.blechat.utils.writeCharUUID
 import java.nio.charset.Charset
 import javax.inject.Inject
 
@@ -197,15 +199,18 @@ class BleClientControllerImpl @Inject constructor(
             if (characteristic.uuid != notifyCharUUID) return
             val message = characteristic.stringValue
             viewModelScope.launch {
-                updateDevices(gatt.device.address, message)
+                updateDevices(gatt.device.address, gatt.device.address, message)
             }
         }
     }
 
     // uas: Suppressed deprecation to be able to test on older devices.
     @Suppress("DEPRECATION")
-    private val BluetoothGattCharacteristic.stringValue
+    private var BluetoothGattCharacteristic.stringValue
         get() = String(value, Charset.defaultCharset())
+        set(value) {
+            setValue(value.toByteArray(Charset.defaultCharset()))
+        }
 
     private fun updateDevices(address: String, isConnected: Boolean) {
         _scannedDevices.update { devices ->
@@ -213,13 +218,13 @@ class BleClientControllerImpl @Inject constructor(
         }
     }
 
-    private fun updateDevices(address: String, message: String) {
+    private fun updateDevices(deviceAddress: String, senderAddress: String, message: String) {
         _scannedDevices.update { devices ->
             devices.map {
-                if (it.address != address) return@map it
+                if (it.address != deviceAddress) return@map it
                 val newMessage = Message(
                     text = message,
-                    senderAddress = address,
+                    senderAddress = senderAddress,
                     isFromLocalUser = false
                 )
                 it.copy(messages = it.messages + newMessage)
@@ -235,8 +240,21 @@ class BleClientControllerImpl @Inject constructor(
         return currentGatt != null
     }
 
+    //uas: Suppressed warning, since we explicitly want to use these addresses.
+    @SuppressLint("HardwareIds")
     override suspend fun sendMessage(message: String, deviceAddress: String): Boolean {
-        TODO()
+        val characteristic = currentGatt?.getService(serviceUUID)
+            ?.getCharacteristic(writeCharUUID)
+            ?: return false
+
+        characteristic.stringValue = message
+        context.checkForConnectPermission {
+            // uas: Suppressed deprecation to be able to test on older devices.
+            @Suppress("DEPRECATION")
+            currentGatt?.writeCharacteristic(characteristic)
+        }
+        updateDevices(deviceAddress, bluetoothAdapter?.address ?: "", message)
+        return true
     }
 
     override fun closeConnection() {
