@@ -1,7 +1,12 @@
 package ru.yandexpraktikum.blechat.data.bluetooth
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
+import android.bluetooth.BluetoothGattCharacteristic
+import android.bluetooth.BluetoothProfile
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
 import android.content.Context
@@ -16,15 +21,24 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import ru.yandexpraktikum.blechat.R
 import ru.yandexpraktikum.blechat.domain.bluetooth.BleClientController
+import ru.yandexpraktikum.blechat.domain.model.Message
 import ru.yandexpraktikum.blechat.domain.model.ScannedBluetoothDevice
+import ru.yandexpraktikum.blechat.presentation.notifications.NotificationsHelper
 import ru.yandexpraktikum.blechat.utils.checkForConnectPermission
+import ru.yandexpraktikum.blechat.utils.notifyCharUUID
+import ru.yandexpraktikum.blechat.utils.serviceUUID
+import ru.yandexpraktikum.blechat.utils.writeCharUUID
+import java.nio.charset.Charset
 import javax.inject.Inject
 
 class BleClientControllerImpl @Inject constructor(
     @ApplicationContext private val context: Context,
     private val bluetoothAdapter: BluetoothAdapter?,
     private val locationManager: LocationManager,
+    private val notificationsHelper: NotificationsHelper,
     private val viewModelScope: CoroutineScope,
 ): BleClientController {
 
@@ -145,16 +159,114 @@ class BleClientControllerImpl @Inject constructor(
         }
     }
 
-    override fun connectToDevice(device: ScannedBluetoothDevice): Boolean {
-        TODO()
+    private var currentGatt: BluetoothGatt? = null
+    private val gattCallback = object : BluetoothGattCallback() {
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
+            super.onConnectionStateChange(gatt, status, newState)
+            if (status != BluetoothGatt.GATT_SUCCESS) return
+            when (newState) {
+                BluetoothProfile.STATE_CONNECTED -> {
+                    context.checkForConnectPermission {
+                        gatt.discoverServices()
+                    }
+                    updateDevices(gatt.device.address, true)
+                }
+
+                BluetoothProfile.STATE_DISCONNECTED -> {
+                    updateDevices(gatt.device.address, false)
+                    closeConnection()
+                }
+            }
+        }
+
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
+            super.onServicesDiscovered(gatt, status)
+            if (status != BluetoothGatt.GATT_SUCCESS) return
+            gatt.getService(serviceUUID)
+                ?.getCharacteristic(notifyCharUUID)
+                ?.let { characteristic ->
+                    context.checkForConnectPermission {
+                        gatt.setCharacteristicNotification(characteristic, true)
+                    }
+                }
+        }
+
+        // uas: Suppressed deprecation to be able to test on older devices.
+        @Suppress("DEPRECATION")
+        @Deprecated("Deprecated in Java")
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic
+        ) {
+            super.onCharacteristicChanged(gatt, characteristic)
+            if (characteristic.uuid != notifyCharUUID) return
+            val message = characteristic.stringValue
+            val title = context.getString(R.string.new_message)
+            notificationsHelper.notifyOnMessageReceived(title, message)
+            viewModelScope.launch {
+                updateDevices(gatt.device.address, gatt.device.address, message)
+            }
+        }
     }
 
+    // uas: Suppressed deprecation to be able to test on older devices.
+    @Suppress("DEPRECATION")
+    private var BluetoothGattCharacteristic.stringValue
+        get() = String(value, Charset.defaultCharset())
+        set(value) {
+            setValue(value.toByteArray(Charset.defaultCharset()))
+        }
+
+    private fun updateDevices(address: String, isConnected: Boolean) {
+        _scannedDevices.update { devices ->
+            devices.map { if (it.address == address) it.copy(isConnected = isConnected) else it }
+        }
+    }
+
+    private fun updateDevices(deviceAddress: String, senderAddress: String, message: String) {
+        _scannedDevices.update { devices ->
+            devices.map {
+                if (it.address != deviceAddress) return@map it
+                val newMessage = Message(
+                    text = message,
+                    senderAddress = senderAddress,
+                    isFromLocalUser = false
+                )
+                it.copy(messages = it.messages + newMessage)
+            }
+        }
+    }
+
+    override fun connectToDevice(device: ScannedBluetoothDevice): Boolean {
+        val remoteDevice = bluetoothAdapter?.getRemoteDevice(device.address)
+        context.checkForConnectPermission {
+            currentGatt = remoteDevice?.connectGatt(context, false, gattCallback)
+        }
+        return currentGatt != null
+    }
+
+    //uas: Suppressed warning, since we explicitly want to use these addresses.
+    @SuppressLint("HardwareIds")
     override suspend fun sendMessage(message: String, deviceAddress: String): Boolean {
-        TODO()
+        val characteristic = currentGatt?.getService(serviceUUID)
+            ?.getCharacteristic(writeCharUUID)
+            ?: return false
+
+        characteristic.stringValue = message
+        context.checkForConnectPermission {
+            // uas: Suppressed deprecation to be able to test on older devices.
+            @Suppress("DEPRECATION")
+            currentGatt?.writeCharacteristic(characteristic)
+        }
+        updateDevices(deviceAddress, bluetoothAdapter?.address ?: "", message)
+        return true
     }
 
     override fun closeConnection() {
-        TODO()
+        context.checkForConnectPermission {
+            currentGatt?.close()
+        }
+        currentGatt = null
     }
 
     override fun release() {
